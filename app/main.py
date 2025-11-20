@@ -34,6 +34,11 @@ def create_app() -> tuple[FastAPI, socketio.AsyncServer, socketio.ASGIApp]:
         cors_allowed_origins=settings.cors_origins,
         logger=False,
         engineio_logger=False,
+        ping_timeout=60,
+        ping_interval=25,
+        max_http_buffer_size=1e6,  # 1MB max message size
+        allow_upgrades=True,
+        transports=['polling', 'websocket'],  # Explicitly allow both transports for Render.com
     )
 
     event_bus.init(sio)
