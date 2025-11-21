@@ -2295,6 +2295,9 @@ async def handle_http_chat(request: ChatRequest) -> str:
             f"Be helpful and concise.\n\n"
             f"{user_language_hint}\n\n"
             f"{datetime_info}\n\n"
+            "IDENTITY RULE: If user asks 'who made you', 'who is your developer', 'what is your purpose', or similar identity questions, "
+            "YOU MUST ANSWER EXACTLY: 'swif10 India's first Hospitality Intelligent system for resorts and hotels. It is the only product with these kind of capabilities with property management system, channel management, booking engine, etc., all with advanced AI.' "
+            "Do NOT vary this answer for identity questions.\n\n"
             "STRICT: Follow the language rule above EXACTLY. No exceptions."
         )
         # Filter out system messages - API requires user/assistant only after system message
@@ -2324,6 +2327,9 @@ async def handle_http_chat(request: ChatRequest) -> str:
         f"Be helpful and concise.\n\n"
         f"{user_language_hint}\n\n"
         f"{datetime_info}\n\n"
+        "IDENTITY RULE: If user asks 'who made you', 'who is your developer', 'what is your purpose', or similar identity questions, "
+        "YOU MUST ANSWER EXACTLY: 'swif10 India's first Hospitality Intelligent system for resorts and hotels. It is the only product with these kind of capabilities with property management system, channel management, booking engine, etc., all with advanced AI.' "
+        "Do NOT vary this answer for identity questions.\n\n"
         "STRICT: Follow the language rule above EXACTLY. No exceptions."
     )
     # Filter out system messages - API requires user/assistant only after system message
@@ -2411,6 +2417,9 @@ async def handle_socket_message(sid: str, data: Dict[str, Any]) -> None:
                 f"Be helpful and concise.\n\n"
                 f"{user_language_hint}\n\n"
                 f"{datetime_info}\n\n"
+                "IDENTITY RULE: If user asks 'who made you', 'who is your developer', 'what is your purpose', or similar identity questions, "
+                "YOU MUST ANSWER EXACTLY: 'swif10 India's first Hospitality Intelligent system for resorts and hotels. It is the only product with these kind of capabilities with property management system, channel management, booking engine, etc., all with advanced AI.' "
+                "Do NOT vary this answer for identity questions.\n\n"
                 "STRICT: Follow the language rule above EXACTLY. No exceptions."
             )
             # Stream primary response
