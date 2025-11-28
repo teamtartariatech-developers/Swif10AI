@@ -1080,6 +1080,10 @@ INTENT_SYSTEM_PROMPT = (
     "IMPORTANT: You must Consider the CONTEXT of previous messages. If the user asks a follow-up question "
     "(e.g., 'explain that', 'why is that', 'in hindi', 'details'), maintain the context of the previous conversation. "
     "Only classify as a NEW query if the user explicitly changes the topic (e.g., asking about 'bills' after asking about 'arrivals').\n\n"
+    "MULTI-TASK DETECTION:\n"
+    "- If the user requests MULTIPLE DIFFERENT tasks (e.g., 'create a reservation and create a coupon'), set is_multi_task=true\n"
+    "- If the user requests the SAME task for MULTIPLE ITEMS (e.g., 'put rooms 101, 102, 103 in maintenance'), set is_multi_task=true\n"
+    "- If is_multi_task=true, you can specify multiple tool_groups as an array, or a single tool_group if all tasks are in the same group\n\n"
     "TOOL GROUPS (Choose wisely):\n"
     "- frontoffice: RESERVATIONS & OPERATIONS. Use for checking availability, creating/finding bookings, check-in/out, and daily arrival/departure lists.\n"
     "- billing_finance: MONEY & BILLS. Use for guest folios, adding charges, payments, checkout billing, and invoices.\n"
@@ -1091,7 +1095,8 @@ INTENT_SYSTEM_PROMPT = (
     "Return STRICT JSON with keys:\n"
     "- _thought: string (Briefly explain your reasoning. What is the user really asking? What context is relevant?)\n"
     "- intent: 'small_talk' | 'info_read' | 'task_write'\n"
-    "- tool_group: string | null (one of the tool groups above, or null for small_talk)\n"
+    "- is_multi_task: boolean (true if user wants multiple tasks, false otherwise)\n"
+    "- tool_group: string | array | null (one tool group, array of tool groups for multi-task, or null for small_talk)\n"
     "- tool: string | null (specific tool name if obvious, otherwise null)\n"
     "- params: object | null (initial params if extractable, or null)\n\n"
     "INTENT RULES:\n"
@@ -1178,10 +1183,16 @@ def _validate_classification(obj: dict) -> dict:
     intent = obj.get("intent")
     if intent not in {"small_talk", "info_read", "task_write"}:
         raise ValueError(f"Invalid intent: {intent}")
-    # tool_group can be None or string
+    # tool_group can be None, string, or array (for multi-task)
     tool_group = obj.get("tool_group")
-    if tool_group is not None and not isinstance(tool_group, str):
-        raise ValueError("tool_group must be string or null")
+    if tool_group is not None:
+        if not isinstance(tool_group, (str, list)):
+            raise ValueError("tool_group must be string, array, or null")
+        if isinstance(tool_group, list):
+            # Validate array elements are strings
+            for tg in tool_group:
+                if not isinstance(tg, str):
+                    raise ValueError("tool_group array elements must be strings")
     # tool can be None or string
     tool = obj.get("tool")
     if tool is not None and not isinstance(tool, str):
@@ -1190,7 +1201,47 @@ def _validate_classification(obj: dict) -> dict:
     params = obj.get("params")
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be object or null")
+    # is_multi_task is optional boolean
+    is_multi_task = obj.get("is_multi_task", False)
+    if not isinstance(is_multi_task, bool):
+        obj["is_multi_task"] = False
     return obj
+
+
+def _get_safe_messages(messages: List[Message], limit: int = 10) -> List[Dict[str, str]]:
+    """
+    Get safe messages for LLM API that requires User/Assistant alternation starting with User.
+    Removes system messages from history.
+    Ensures the first message is from 'user'.
+    """
+    # 1. Get candidates (excluding system)
+    candidates = [m for m in messages if m.role != "system"]
+    
+    # 2. Slice to limit
+    sliced = candidates[-limit:] if limit > 0 else candidates
+    
+    if not sliced:
+        return [{"role": "user", "content": "Please proceed."}]
+        
+    # 3. Check if first message is user
+    if sliced[0].role == "user":
+        return [m.model_dump() for m in sliced]
+        
+    # 4. If not, try to find a preceding user message from the FULL list
+    # Find index of first sliced message in candidates
+    first_msg = sliced[0]
+    try:
+        idx = candidates.index(first_msg)
+        # Search backwards from idx-1
+        for i in range(idx - 1, -1, -1):
+            if candidates[i].role == "user":
+                return [candidates[i].model_dump()] + [m.model_dump() for m in sliced]
+    except ValueError:
+        pass
+        
+    # 5. If no preceding user message found, prepend a dummy one
+    return [{"role": "user", "content": "Please proceed."}] + [m.model_dump() for m in sliced]
+
 
 
 def _get_tools_by_group(group: str, operation: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1805,7 +1856,7 @@ async def _llm1_classify(messages: List[Message]) -> dict:
     system_prompt = f"{INTENT_SYSTEM_PROMPT}\n\n{datetime_info}"
     llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
     # Filter out system messages - API requires user/assistant only after system message
-    llm_messages.extend(m.model_dump() for m in messages[-8:] if m.role != "system")
+    llm_messages.extend(_get_safe_messages(messages, limit=8))
     result = await llm_sarvam.chat(llm_messages)
     try:
         # Check for empty response
@@ -1881,28 +1932,7 @@ async def _llm1_info_fetch(
     )
     
     # Filter out system messages - API requires user/assistant only after system message
-    # Ensure first message after system is always from user
-    filtered = [m.model_dump() for m in messages[-6:] if m.role != "system"]
-    
-    # Find the latest user message index to ensure proper ordering
-    latest_user_idx = -1
-    for i, msg in enumerate(messages):
-        if msg.role == "user":
-            latest_user_idx = i
-    
-    if latest_user_idx >= 0:
-        # Start from latest user message and include subsequent messages (excluding system)
-        conversation_messages = [m.model_dump() for m in messages[latest_user_idx:] if m.role != "system"]
-    else:
-        conversation_messages = filtered if filtered else [{"role": "user", "content": "Extract parameters from the user's query."}]
-    
-    # Double-check: ensure first message is from user
-    if conversation_messages and conversation_messages[0].get("role") != "user":
-        user_msg = next((m.model_dump() for m in reversed(messages) if m.role == "user"), None)
-        if user_msg:
-            conversation_messages = [user_msg] + conversation_messages
-        else:
-            conversation_messages = [{"role": "user", "content": "Extract parameters from the user's query."}]
+    conversation_messages = _get_safe_messages(messages, limit=6)
     
     llm_messages: List[Dict[str, str]] = [
         {"role": "system", "content": info_fetch_prompt},
@@ -1999,28 +2029,7 @@ async def _llm1_task_fetch(
     )
     
     # Filter out system messages - API requires user/assistant only after system message
-    # Ensure first message after system is always from user
-    filtered = [m.model_dump() for m in messages[-6:] if m.role != "system"]
-    
-    # Find the latest user message index to ensure proper ordering
-    latest_user_idx = -1
-    for i, msg in enumerate(messages):
-        if msg.role == "user":
-            latest_user_idx = i
-    
-    if latest_user_idx >= 0:
-        # Start from latest user message and include subsequent messages (excluding system)
-        conversation_messages = [m.model_dump() for m in messages[latest_user_idx:] if m.role != "system"]
-    else:
-        conversation_messages = filtered if filtered else [{"role": "user", "content": "Extract parameters from the user's query."}]
-    
-    # Double-check: ensure first message is from user
-    if conversation_messages and conversation_messages[0].get("role") != "user":
-        user_msg = next((m.model_dump() for m in reversed(messages) if m.role == "user"), None)
-        if user_msg:
-            conversation_messages = [user_msg] + conversation_messages
-        else:
-            conversation_messages = [{"role": "user", "content": "Extract parameters from the user's query."}]
+    conversation_messages = _get_safe_messages(messages, limit=6)
     
     llm_messages: List[Dict[str, str]] = [
         {"role": "system", "content": task_fetch_prompt},
@@ -2079,6 +2088,116 @@ async def _llm1_task_fetch(
     extracted = await _convert_names_to_ids_in_params(extracted, token=token)
     
     return extracted
+
+
+async def _llm1_multi_task_fetch(
+    messages: List[Message],
+    tool_groups: List[str],
+    context: Optional[str] = None,
+    token: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Extract multiple tool calls from user query for multi-task scenarios.
+    Returns array of task results, each with: tool, params, status, missing_params.
+    Handles both different tasks and same task for multiple items.
+    """
+    # Get all available tools from all specified tool groups
+    all_tools = []
+    for tool_group in tool_groups:
+        filtered_tools = _get_tools_by_group(tool_group, operation="write")
+        for tool in filtered_tools:
+            tool_info = {
+                "name": tool["name"],
+                "description": tool["description"],
+                "params": tool["params"],
+                "group": tool_group
+            }
+            all_tools.append(tool_info)
+    
+    # Build system prompt with context
+    context_part = f"\n\nCONTEXT FROM PREVIOUS CONVERSATION:\n{context}\n" if context else ""
+    datetime_info = _get_current_datetime_info()
+    
+    multi_task_prompt = (
+        f"You are an AI that extracts MULTIPLE tool calls from user task requests.\n\n"
+        f"IMPORTANT: You understand any language the user speaks, but you MUST respond in English with valid JSON only.\n\n"
+        f"{datetime_info}\n\n"
+        f"AVAILABLE TOOLS (from {', '.join(tool_groups)} groups):\n"
+        f"{json.dumps(all_tools, indent=2)}\n\n"
+        f"CRITICAL INSTRUCTIONS FOR MULTI-TASK EXTRACTION:\n"
+        f"1. The user wants to perform MULTIPLE tasks. Extract ALL tasks from their request.\n"
+        f"2. If user says 'create reservation and create coupon', extract TWO separate tool calls.\n"
+        f"3. If user says 'put rooms 101, 102, 103 in maintenance', extract THREE tool calls (one per room).\n"
+        f"4. If user provides a LIST of items (e.g., room names, guest names), create ONE tool call PER item.\n"
+        f"5. For each tool call, extract ALL required parameters (including nested fields).\n"
+        f"6. If a parameter is missing for a tool call, set status=false and include missing_params.\n"
+        f"7. For list-based tasks (e.g., multiple rooms), extract the list item in the appropriate parameter field.\n"
+        f"8. When user mentions 'today', 'tomorrow', 'yesterday', use the dates provided above.\n"
+        f"9. For ID parameters: If user provides a NAME, extract it as-is. System will convert to ID.\n\n"
+        f"Return STRICT JSON with this structure:\n"
+        f"{{\n"
+        f"  \"tasks\": [\n"
+        f"    {{\n"
+        f"      \"tool\": \"tool_name\",\n"
+        f"      \"tool_group\": \"group_name\",\n"
+        f"      \"params\": {{...}},\n"
+        f"      \"status\": true/false,\n"
+        f"      \"missing_params\": {{...}} or null\n"
+        f"    }},\n"
+        f"    ...\n"
+        f"  ]\n"
+        f"}}\n\n"
+        f"{context_part}"
+        f"Respond ONLY in English with valid JSON. Do not add extra text."
+    )
+    
+    # Filter out system messages - API requires user/assistant only after system message
+    conversation_messages = _get_safe_messages(messages, limit=6)
+    
+    llm_messages: List[Dict[str, str]] = [
+        {"role": "system", "content": multi_task_prompt},
+        *conversation_messages
+    ]
+    result = await llm_sarvam.chat(llm_messages)
+    
+    # Check for empty response
+    if not result.response or not result.response.strip():
+        print("DEBUG: Empty LLM response for multi_task_fetch")
+        return []
+    
+    extracted = _safe_json_loads(result.response)
+    
+    # Validate structure
+    if not isinstance(extracted, dict):
+        print("DEBUG: Invalid multi_task_fetch response structure")
+        return []
+    
+    tasks = extracted.get("tasks", [])
+    if not isinstance(tasks, list):
+        print("DEBUG: 'tasks' is not an array in multi_task_fetch response")
+        return []
+    
+    # Process each task: convert names to IDs and validate
+    processed_tasks = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        
+        # Ensure required fields
+        if "tool" not in task:
+            task["tool"] = None
+        if "params" not in task:
+            task["params"] = {}
+        if "status" not in task:
+            task["status"] = False
+        if "missing_params" not in task:
+            task["missing_params"] = None
+        
+        # Post-process: Convert names to IDs if needed
+        task = await _convert_names_to_ids_in_params(task, token=token)
+        processed_tasks.append(task)
+    
+    return processed_tasks
 
 
 async def _llm1_handle_missing_params(
@@ -2202,7 +2321,7 @@ async def _llm1_handle_missing_params(
     )
     
     # Filter out system messages - API requires user/assistant only after system message
-    conversation_messages = [m.model_dump() for m in messages[-4:] if m.role != "system"]
+    conversation_messages = _get_safe_messages(messages, limit=4)
     llm_messages: List[Dict[str, str]] = [
         {"role": "system", "content": missing_prompt},
         *conversation_messages
@@ -2223,7 +2342,7 @@ async def _llm1_generate_from_data(messages: List[Message], data: object) -> str
         {"role": "system", "content": system_content},
     ]
     # Filter out system messages - API requires user/assistant only after system message
-    llm_messages.extend(m.model_dump() for m in messages[-6:] if m.role != "system")
+    llm_messages.extend(_get_safe_messages(messages, limit=6))
     result = await llm_sarvam.chat(llm_messages, max_completion_tokens=settings.summary_max_tokens)
     return result.response
 
@@ -2277,7 +2396,7 @@ async def _run_agent(messages: List[Message]) -> str:
     datetime_info = _get_current_datetime_info()
     llm_messages: List[Dict[str, str]] = [{"role": "system", "content": f"You are an expert PMS operations agent.\n\n{datetime_info}"}]
     # Filter out system messages - API requires user/assistant only after system message
-    llm_messages.extend(m.model_dump() for m in messages[-10:] if m.role != "system")
+    llm_messages.extend(_get_safe_messages(messages, limit=10))
     result = await llm_sarvam.chat(llm_messages)
     return result.response
 
@@ -2305,7 +2424,7 @@ async def handle_http_chat(request: ChatRequest) -> str:
             "STRICT: Follow the language rule above EXACTLY. No exceptions."
         )
         # Filter out system messages - API requires user/assistant only after system message
-        conversation_messages = [m.model_dump() for m in request.messages[-10:] if m.role != "system"]
+        conversation_messages = _get_safe_messages(request.messages, limit=10)
         draft = (await llm_sarvam.chat([{"role": "system", "content": system_content}, *conversation_messages])).response
         return await _llm1_summarize(draft, intent="small_talk", messages=request.messages)
 
@@ -2436,28 +2555,7 @@ async def handle_socket_message(sid: str, data: Dict[str, Any]) -> None:
             )
             # Stream primary response
             # Filter out system messages - API requires user/assistant only after system message
-            # Ensure first message after system is always from user
-            filtered = [m.model_dump() for m in req.messages[-10:] if m.role != "system"]
-            
-            # Find the latest user message index to ensure proper ordering
-            latest_user_idx = -1
-            for i, msg in enumerate(req.messages):
-                if msg.role == "user":
-                    latest_user_idx = i
-            
-            if latest_user_idx >= 0:
-                # Start from latest user message and include subsequent messages (excluding system)
-                conversation_messages = [m.model_dump() for m in req.messages[latest_user_idx:] if m.role != "system"]
-            else:
-                conversation_messages = filtered if filtered else [{"role": "user", "content": "Please respond."}]
-            
-            # Double-check: ensure first message is from user
-            if conversation_messages and conversation_messages[0].get("role") != "user":
-                user_msg = next((m.model_dump() for m in reversed(req.messages) if m.role == "user"), None)
-                if user_msg:
-                    conversation_messages = [user_msg] + conversation_messages
-                else:
-                    conversation_messages = [{"role": "user", "content": "Please respond."}]
+            conversation_messages = _get_safe_messages(req.messages, limit=10)
             
             stream = llm_sarvam.chat_stream([
                 {"role": "system", "content": system_content},
@@ -2782,12 +2880,180 @@ async def handle_socket_message(sid: str, data: Dict[str, Any]) -> None:
 
         elif intent == "task_write":
             tool_group = classification.get("tool_group")
+            is_multi_task = classification.get("is_multi_task", False)
             
             if not tool_group:
                 error_msg = "Classification did not specify a tool_group for task_write intent"
                 await event_bus.emit_error(sid, req.message_id, error_msg)
                 text = "I couldn't determine which category of task to perform. Please be more specific."
+            elif is_multi_task:
+                # MULTI-TASK HANDLING
+                try:
+                    # Build context from conversation history
+                    context_messages = [m.model_dump() for m in req.messages[-10:]]
+                    context_str = json.dumps(context_messages, ensure_ascii=False)
+                    
+                    # Normalize tool_group to array
+                    if isinstance(tool_group, str):
+                        tool_groups = [tool_group]
+                    elif isinstance(tool_group, list):
+                        tool_groups = tool_group
+                    else:
+                        tool_groups = []
+                    
+                    if not tool_groups:
+                        error_msg = "No tool groups specified for multi-task"
+                        await event_bus.emit_error(sid, req.message_id, error_msg)
+                        text = "I couldn't determine which tasks to perform. Please be more specific."
+                    else:
+                        await event_bus.emit_agent_status(sid, stage="planning", detail=f"Analyzing multi-task request across {len(tool_groups)} task groups")
+                        try:
+                            client_token = token_storage.get_token(sid) or settings.backend_api_token
+                            multi_task_results = await asyncio.wait_for(
+                                _llm1_multi_task_fetch(req.messages, tool_groups, context=context_str, token=client_token),
+                                timeout=30.0  # Longer timeout for multi-task
+                            )
+                        except asyncio.TimeoutError:
+                            error_msg = "Multi-task parameter extraction timed out"
+                            await event_bus.emit_error(sid, req.message_id, error_msg)
+                            text = "Sorry, analyzing your multi-task request took too long. Please try again."
+                        except Exception as multi_task_err:
+                            error_msg = f"Multi-task parameter extraction failed: {str(multi_task_err)}"
+                            print(f"Multi-task fetch error: {error_msg}")
+                            await event_bus.emit_error(sid, req.message_id, error_msg)
+                            text = f"Sorry, I couldn't understand your multi-task request: {str(multi_task_err)}"
+                        else:
+                            if not multi_task_results:
+                                text = "I couldn't extract any tasks from your request. Please be more specific."
+                            else:
+                                # Execute all tasks sequentially
+                                all_results = []
+                                all_succeeded = []
+                                all_failed = []
+                                
+                                await event_bus.emit_agent_status(sid, stage="planning", detail=f"Executing {len(multi_task_results)} tasks")
+                                
+                                for idx, task_result in enumerate(multi_task_results):
+                                    task_tool = task_result.get("tool")
+                                    task_params = task_result.get("params") or {}
+                                    task_status = task_result.get("status", False)
+                                    task_missing = task_result.get("missing_params")
+                                    
+                                    if not task_status and task_missing:
+                                        # Task has missing params - skip for now (could ask user, but for multi-task we'll report)
+                                        all_failed.append({
+                                            "task": task_tool or "unknown",
+                                            "error": "Missing required parameters",
+                                            "missing": task_missing
+                                        })
+                                        continue
+                                    
+                                    if not task_tool:
+                                        all_failed.append({
+                                            "task": "unknown",
+                                            "error": "Could not determine tool"
+                                        })
+                                        continue
+                                    
+                                    # Execute the task
+                                    try:
+                                        await event_bus.emit_agent_status(sid, stage="tool_call", detail=f"Executing task {idx + 1}/{len(multi_task_results)}: {task_tool}")
+                                        fn = _resolve_tool(task_tool)
+                                        filtered_params = _filter_params(fn, task_params)
+                                        
+                                        # Add client token if available
+                                        if client_token and "token" in inspect.signature(fn).parameters:
+                                            filtered_params["token"] = client_token
+                                        
+                                        await event_bus.emit_agent_tool_start(sid, task_tool, filtered_params)
+                                        
+                                        # Execute with timeout
+                                        result = await asyncio.wait_for(
+                                            fn(**filtered_params),  # type: ignore[misc]
+                                            timeout=30.0
+                                        )
+                                        normalized_result = _normalize_tool_result(result)
+                                        await event_bus.emit_agent_tool_result(sid, task_tool, normalized_result)
+                                        
+                                        all_results.append({
+                                            "tool": task_tool,
+                                            "params": task_params,
+                                            "result": normalized_result,
+                                            "success": True
+                                        })
+                                        all_succeeded.append(task_tool)
+                                        
+                                    except asyncio.TimeoutError:
+                                        error_msg = f"Task {task_tool} timed out"
+                                        all_failed.append({
+                                            "task": task_tool,
+                                            "error": error_msg
+                                        })
+                                        await event_bus.emit_error(sid, req.message_id, error_msg)
+                                    except Exception as task_err:
+                                        error_msg = f"Task {task_tool} failed: {str(task_err)}"
+                                        all_failed.append({
+                                            "task": task_tool,
+                                            "error": error_msg
+                                        })
+                                        await event_bus.emit_error(sid, req.message_id, error_msg)
+                                        print(f"Multi-task execution error for {task_tool}: {error_msg}")
+                                
+                                # Generate comprehensive response from all results
+                                await event_bus.emit_agent_status(sid, stage="planning", detail="Generating multi-task summary")
+                                datetime_info = _get_current_datetime_info()
+                                user_language_hint = _get_language_instruction()
+                                
+                                multi_task_summary_prompt = (
+                                    f"You are an expert Hotel Operations Assistant. Generate a comprehensive summary of multiple tasks that were executed.\n\n"
+                                    f"{user_language_hint}\n\n"
+                                    f"{datetime_info}\n\n"
+                                    f"TASKS EXECUTED:\n{json.dumps(all_results, indent=2, ensure_ascii=False)}\n\n"
+                                    f"SUCCEEDED: {len(all_succeeded)} tasks\n"
+                                    f"FAILED: {len(all_failed)} tasks\n\n"
+                                    f"Generate a clear, user-friendly message that:\n"
+                                    f"1. Lists all tasks that succeeded with relevant details\n"
+                                    f"2. Mentions any tasks that failed with brief error information\n"
+                                    f"3. Uses bullet points for clarity\n"
+                                    f"4. Matches the user's language and tone\n\n"
+                                    f"STRICT: Follow the language rule above EXACTLY. No exceptions."
+                                )
+                                
+                                conversation_messages = _get_safe_messages(req.messages, limit=6)
+                                summary_stream = llm_sarvam.chat_stream([
+                                    {"role": "system", "content": multi_task_summary_prompt},
+                                    *conversation_messages
+                                ])
+                                summary_acc = []
+                                async for token in summary_stream:
+                                    summary_acc.append(token)
+                                    await event_bus.emit_token(sid, req.message_id or "", token)
+                                text = "".join(summary_acc)
+                                
+                                # Final summarization
+                                await event_bus.emit_agent_status(sid, stage="planning", detail="Finalizing response")
+                                final_summary_prompt = (
+                                    f"{SUMMARY_SYSTEM_PROMPT}\n\n"
+                                    f"{datetime_info}\n\n"
+                                    f"{user_language_hint}\n\n"
+                                    "This is a multi-task execution summary. Be concise and clear."
+                                )
+                                final_stream = llm_sarvam.chat_stream([
+                                    {"role": "system", "content": final_summary_prompt},
+                                    {"role": "user", "content": text},
+                                ], max_completion_tokens=settings.summary_max_tokens)
+                                final_acc = []
+                                async for token in final_stream:
+                                    final_acc.append(token)
+                                    await event_bus.emit_token(sid, req.message_id or "", token)
+                                text = "".join(final_acc)
+                except Exception as multi_task_err:
+                    error_msg = f"Multi-task execution failed: {str(multi_task_err)}"
+                    print(f"Multi-task error: {error_msg}")
+                    await event_bus.emit_error(sid, req.message_id, error_msg)
+                    text = f"Sorry, I couldn't complete the multi-task request: {str(multi_task_err)}"
             else:
+                # SINGLE TASK HANDLING (existing logic)
                 try:
                     # Build context from conversation history
                     context_messages = [m.model_dump() for m in req.messages[-10:]]
@@ -3374,30 +3640,8 @@ async def handle_socket_message(sid: str, data: Dict[str, Any]) -> None:
                                 )
                                 
                                 # Filter out system messages - API requires user/assistant only after system message
-                                # Ensure first message after system is always from user
-                                filtered = [m.model_dump() for m in req.messages[-6:] if m.role != "system"]
+                                conversation_messages = _get_safe_messages(req.messages, limit=6)
                                 
-                                # Find the latest user message index to ensure proper ordering
-                                latest_user_idx = -1
-                                for i, msg in enumerate(req.messages):
-                                    if msg.role == "user":
-                                        latest_user_idx = i
-                                
-                                if latest_user_idx >= 0:
-                                    # Start from latest user message and include subsequent messages (excluding system)
-                                    conversation_messages = [m.model_dump() for m in req.messages[latest_user_idx:] if m.role != "system"]
-                                else:
-                                    # No user messages found, create a simple one
-                                    conversation_messages = [{"role": "user", "content": "Generate a response about the task result."}]
-                                
-                                # Double-check: ensure first message is from user
-                                if conversation_messages and conversation_messages[0].get("role") != "user":
-                                    # If first message is assistant, prepend latest user message
-                                    user_msg = next((m.model_dump() for m in reversed(req.messages) if m.role == "user"), None)
-                                    if user_msg:
-                                        conversation_messages = [user_msg] + conversation_messages
-                                    else:
-                                        conversation_messages = [{"role": "user", "content": "Generate a response about the task result."}]
                                 agent_stream = llm_sarvam.chat_stream([
                                     {"role": "system", "content": agent_system_prompt},
                                     *conversation_messages
@@ -3456,28 +3700,7 @@ async def handle_socket_message(sid: str, data: Dict[str, Any]) -> None:
             )
             # Stream fallback response
             # Filter out system messages - API requires user/assistant only after system message
-            # Ensure first message after system is always from user
-            filtered = [m.model_dump() for m in req.messages[-10:] if m.role != "system"]
-            
-            # Find the latest user message index to ensure proper ordering
-            latest_user_idx = -1
-            for i, msg in enumerate(req.messages):
-                if msg.role == "user":
-                    latest_user_idx = i
-            
-            if latest_user_idx >= 0:
-                # Start from latest user message and include subsequent messages (excluding system)
-                conversation_messages = [m.model_dump() for m in req.messages[latest_user_idx:] if m.role != "system"]
-            else:
-                conversation_messages = filtered if filtered else [{"role": "user", "content": "Please respond."}]
-            
-            # Double-check: ensure first message is from user
-            if conversation_messages and conversation_messages[0].get("role") != "user":
-                user_msg = next((m.model_dump() for m in reversed(req.messages) if m.role == "user"), None)
-                if user_msg:
-                    conversation_messages = [user_msg] + conversation_messages
-                else:
-                    conversation_messages = [{"role": "user", "content": "Please respond."}]
+            conversation_messages = _get_safe_messages(req.messages, limit=10)
             
             stream = llm_sarvam.chat_stream([
                 {"role": "system", "content": system_content},
